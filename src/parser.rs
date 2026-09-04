@@ -1,11 +1,13 @@
 //! Validating parser for phone numbers.
 //!
 //! NANP (+1) numbers get checked against the actual area-code and
-//! exchange-code rules. Everything else only gets checked against the
-//! E.164 length envelope, because splitting an arbitrary international
-//! number into country code and national number correctly requires a
-//! table of country-code prefixes we don't have yet (see README).
+//! exchange-code rules. Everything else gets its country calling code
+//! split off with the real ITU-T E.164 prefix table (see
+//! `country_codes`) and then only an overall length check, since
+//! validating the national number itself would require each country's
+//! own numbering plan.
 
+use crate::country_codes;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +23,7 @@ pub enum ParseError {
     TooLong,
     InvalidNanpAreaCode,
     InvalidNanpExchangeCode,
+    UnknownCountryCode,
 }
 
 impl fmt::Display for ParseError {
@@ -31,6 +34,7 @@ impl fmt::Display for ParseError {
             ParseError::TooLong => "more than the 15 digits E.164 allows",
             ParseError::InvalidNanpAreaCode => "NANP area code can't start with 0 or 1",
             ParseError::InvalidNanpExchangeCode => "NANP exchange code can't start with 0 or 1",
+            ParseError::UnknownCountryCode => "digits don't start with any assigned country calling code",
         };
         f.write_str(msg)
     }
@@ -72,15 +76,13 @@ fn parse_e164(digits: &str) -> Result<PhoneNumber, ParseError> {
     if digits.starts_with('1') && digits.len() == 11 {
         return parse_nanp(&digits[1..], 1);
     }
-    // No country-code table yet, so treat the first three digits as
-    // the country code. That's enough to round-trip through the
-    // pretty printer but not guaranteed to match the real dialing
-    // plan for every country. Tracked as follow-up work.
-    let cc: u16 = digits[..3].parse().expect("3 ascii digits");
-    Ok(PhoneNumber {
-        country_code: cc,
-        national_number: digits[3..].to_string(),
-    })
+    match country_codes::split(digits) {
+        Some((cc, national)) => Ok(PhoneNumber {
+            country_code: cc,
+            national_number: national.to_string(),
+        }),
+        None => Err(ParseError::UnknownCountryCode),
+    }
 }
 
 fn parse_nanp(national: &str, country_code: u16) -> Result<PhoneNumber, ParseError> {
@@ -160,5 +162,28 @@ mod tests {
     #[test]
     fn rejects_no_digits() {
         assert_eq!(parse("call me"), Err(ParseError::NoDigits));
+    }
+
+    #[test]
+    fn splits_two_digit_country_code() {
+        let n = parse("+44 20 7946 0958").unwrap();
+        assert_eq!(n.country_code, 44);
+        assert_eq!(n.national_number, "2079460958");
+        assert_eq!(n.to_string(), "+44 2079460958");
+    }
+
+    #[test]
+    fn splits_three_digit_country_code() {
+        let n = parse("+212 6 12 34 56 78").unwrap();
+        assert_eq!(n.country_code, 212);
+        assert_eq!(n.national_number, "612345678");
+    }
+
+    #[test]
+    fn rejects_unassigned_country_code() {
+        assert_eq!(
+            parse("+999 123 4567"),
+            Err(ParseError::UnknownCountryCode)
+        );
     }
 }

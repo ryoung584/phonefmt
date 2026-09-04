@@ -17,9 +17,9 @@ a pipe without worrying about memory.
 ## Status
 
 North American Numbering Plan (+1) numbers are fully validated.
-Everything else currently only gets an E.164 length check plus a
-best-effort split into country code and national number — see
-[Limitations](#limitations).
+Everything else gets its country calling code split off using the real
+ITU-T E.164 assignment table (longest-prefix match, not a guess), plus
+an overall length check — see [Limitations](#limitations).
 
 ## Usage
 
@@ -66,8 +66,9 @@ and exits non-zero if any candidate failed to parse.
 ## Limitations
 
 - Only NANP numbers get full validation. Other countries only get a
-  length check, and the country-code/national-number split for them is
-  a guess (first three digits), not backed by a real prefix table.
+  length check; the national number itself isn't checked against that
+  country's own numbering plan, and formatting falls back to a plain
+  `+cc national-number` instead of that country's normal grouping.
 - The scanner's candidate boundary is "run of digits, `+ - . ( ) space`
   characters." Two numbers separated only by a single space will be
   read as one candidate and likely fail to parse. See the roadmap in
