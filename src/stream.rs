@@ -64,15 +64,61 @@ pub fn scan<R: Read, F: FnMut(&str, Result<PhoneNumber, ParseError>)>(
     Ok(())
 }
 
+/// Below this many digits a run isn't worth handing to the parser at
+/// all (matches the shortest national numbers we validate).
+const MIN_CANDIDATE_DIGITS: usize = 7;
+
+fn digit_count(s: &str) -> usize {
+    s.chars().filter(|c| c.is_ascii_digit()).count()
+}
+
+/// Parse whatever accumulated in `candidate`, which may actually be two
+/// or more numbers that got joined by a single space acting as a
+/// separator rather than internal grouping (e.g. two office extensions
+/// listed as "212-555-0143 800-555-0199"). If the whole run doesn't
+/// parse, look for the longest leading segment ending at a space that
+/// does, report it, and keep working through what's left, so a
+/// single-space gap between numbers no longer drags them both down.
 fn flush<F: FnMut(&str, Result<PhoneNumber, ParseError>)>(
     candidate: &mut String,
     on_match: &mut F,
 ) {
-    let digit_count = candidate.chars().filter(|c| c.is_ascii_digit()).count();
-    if digit_count >= 7 {
-        let result = parser::parse(candidate);
-        on_match(candidate, result);
+    let mut remaining = candidate.as_str();
+
+    loop {
+        let text = remaining.trim_matches(' ');
+        if text.is_empty() || digit_count(text) < MIN_CANDIDATE_DIGITS {
+            break;
+        }
+
+        if let Ok(number) = parser::parse(text) {
+            on_match(text, Ok(number));
+            break;
+        }
+
+        let space_positions = text.char_indices().filter(|&(_, c)| c == ' ').map(|(i, _)| i);
+        let mut split = None;
+        for pos in space_positions.collect::<Vec<_>>().into_iter().rev() {
+            let head = &text[..pos];
+            if digit_count(head) < MIN_CANDIDATE_DIGITS {
+                continue;
+            }
+            if let Ok(number) = parser::parse(head) {
+                on_match(head, Ok(number));
+                split = Some(pos);
+                break;
+            }
+        }
+
+        match split {
+            Some(pos) => remaining = &text[pos + 1..],
+            None => {
+                on_match(text, parser::parse(text));
+                break;
+            }
+        }
     }
+
     candidate.clear();
 }
 
@@ -122,5 +168,51 @@ mod tests {
         let mut found = Vec::new();
         scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn splits_two_numbers_joined_by_a_single_space() {
+        let input = "212-555-0143 800-555-0199";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, "212-555-0143");
+        assert!(found[0].1.is_ok());
+        assert_eq!(found[1].0, "800-555-0199");
+        assert!(found[1].1.is_ok());
+    }
+
+    #[test]
+    fn splits_three_numbers_joined_by_single_spaces() {
+        let input = "212-555-0143 800-555-0199 415-555-0100";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        let raws: Vec<&str> = found.iter().map(|(raw, _)| raw.as_str()).collect();
+        assert_eq!(raws, vec!["212-555-0143", "800-555-0199", "415-555-0100"]);
+        assert!(found.iter().all(|(_, result)| result.is_ok()));
+    }
+
+    #[test]
+    fn does_not_split_a_single_number_with_internal_grouping_spaces() {
+        // "+44 20 7946 0958" is one number whose groups happen to be
+        // space-separated; it must not be chopped into pieces.
+        let input = "call +44 20 7946 0958 now";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "+44 20 7946 0958");
+        assert!(found[0].1.is_ok());
+    }
+
+    #[test]
+    fn joined_valid_and_invalid_number_reports_both() {
+        let input = "212-555-0143 000-000-0000";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, "212-555-0143");
+        assert!(found[0].1.is_ok());
+        assert_eq!(found[1].0, "000-000-0000");
+        assert!(found[1].1.is_err());
     }
 }

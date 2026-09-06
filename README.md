@@ -70,9 +70,11 @@ and exits non-zero if any candidate failed to parse.
   country's own numbering plan, and formatting falls back to a plain
   `+cc national-number` instead of that country's normal grouping.
 - The scanner's candidate boundary is "run of digits, `+ - . ( ) space`
-  characters." Two numbers separated only by a single space will be
-  read as one candidate and likely fail to parse. See the roadmap in
-  the commit history for planned fixes.
+  characters," so two numbers separated only by a single space still
+  end up in the same candidate run. When that whole run fails to parse,
+  the scanner looks for the longest leading segment that does, reports
+  it, and keeps going with what's left — but a pathological run that
+  happens to parse as one (very) long invalid number won't get split.
 
 ## License
 
