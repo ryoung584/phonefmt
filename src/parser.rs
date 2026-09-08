@@ -120,6 +120,20 @@ impl fmt::Display for PhoneNumber {
                 n[8] as char,
                 n[9] as char,
             )
+        } else if let Some(groups) =
+            country_codes::group_sizes(self.country_code, self.national_number.len())
+        {
+            write!(f, "+{} ", self.country_code)?;
+            let mut rest = self.national_number.as_str();
+            for (i, &size) in groups.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(" ")?;
+                }
+                let (head, tail) = rest.split_at(size);
+                f.write_str(head)?;
+                rest = tail;
+            }
+            Ok(())
         } else {
             write!(f, "+{} {}", self.country_code, self.national_number)
         }
@@ -185,5 +199,34 @@ mod tests {
             parse("+999 123 4567"),
             Err(ParseError::UnknownCountryCode)
         );
+    }
+
+    #[test]
+    fn formats_french_number_with_national_grouping() {
+        let n = parse("+33 6 12 34 56 78").unwrap();
+        assert_eq!(n.to_string(), "+33 6 12 34 56 78");
+    }
+
+    #[test]
+    fn formats_indian_number_with_national_grouping() {
+        let n = parse("+91 9876543210").unwrap();
+        assert_eq!(n.to_string(), "+91 98765 43210");
+    }
+
+    #[test]
+    fn formats_brazilian_mobile_and_landline_differently() {
+        let mobile = parse("+55 11987654321").unwrap();
+        assert_eq!(mobile.to_string(), "+55 11 98765 4321");
+
+        let landline = parse("+55 1123456789").unwrap();
+        assert_eq!(landline.to_string(), "+55 11 2345 6789");
+    }
+
+    #[test]
+    fn unlisted_country_still_falls_back_to_plain_form() {
+        // UK (44) has no fixed-length grouping entry, so it keeps the
+        // generic "+cc national-number" form.
+        let n = parse("+44 20 7946 0958").unwrap();
+        assert_eq!(n.to_string(), "+44 2079460958");
     }
 }

@@ -67,8 +67,11 @@ and exits non-zero if any candidate failed to parse.
 
 - Only NANP numbers get full validation. Other countries only get a
   length check; the national number itself isn't checked against that
-  country's own numbering plan, and formatting falls back to a plain
-  `+cc national-number` instead of that country's normal grouping.
+  country's own numbering plan. A handful of countries with a fixed,
+  unambiguous digit grouping (France, Spain, Russia/Kazakhstan, China
+  mobile, India, Mexico, Brazil, South Africa, Singapore, Hong Kong)
+  print with that grouping; everything else still falls back to a
+  plain `+cc national-number`.
 - The scanner's candidate boundary is "run of digits, `+ - . ( ) space`
   characters," so two numbers separated only by a single space still
   end up in the same candidate run. When that whole run fails to parse,

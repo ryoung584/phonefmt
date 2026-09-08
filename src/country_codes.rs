@@ -66,6 +66,28 @@ pub fn split(digits: &str) -> Option<(u16, &str)> {
     None
 }
 
+/// Digit-grouping used when printing a national number, keyed by
+/// (country calling code, national number length). Kept to countries
+/// where a number of that length has one unambiguous, fixed grouping
+/// in ordinary use, so this never has to guess. Anything not listed
+/// here falls back to the plain, ungrouped form.
+pub fn group_sizes(country_code: u16, national_len: usize) -> Option<&'static [usize]> {
+    match (country_code, national_len) {
+        (33, 9) => Some(&[1, 2, 2, 2, 2]),  // France: 6 12 34 56 78
+        (34, 9) => Some(&[3, 3, 3]),        // Spain: 612 345 678
+        (7, 10) => Some(&[3, 3, 2, 2]),     // Russia/Kazakhstan: 916 123 45 67
+        (86, 11) => Some(&[3, 4, 4]),       // China mobile: 138 0013 8000
+        (91, 10) => Some(&[5, 5]),          // India: 98765 43210
+        (52, 10) => Some(&[3, 3, 4]),       // Mexico: 551 234 5678
+        (55, 11) => Some(&[2, 5, 4]),       // Brazil mobile: 11 98765 4321
+        (55, 10) => Some(&[2, 4, 4]),       // Brazil landline: 11 2345 6789
+        (27, 9) => Some(&[2, 3, 4]),        // South Africa: 82 123 4567
+        (65, 8) => Some(&[4, 4]),           // Singapore: 6123 4567
+        (852, 8) => Some(&[4, 4]),          // Hong Kong: 6123 4567
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,5 +119,31 @@ mod tests {
         // The whole string being a valid code with no digits left for a
         // national number isn't a real phone number.
         assert_eq!(split("44"), None);
+    }
+
+    #[test]
+    fn group_sizes_sum_to_the_length_they_are_keyed_on() {
+        let lens_to_check: &[(u16, usize)] = &[
+            (33, 9),
+            (34, 9),
+            (7, 10),
+            (86, 11),
+            (91, 10),
+            (52, 10),
+            (55, 11),
+            (55, 10),
+            (27, 9),
+            (65, 8),
+            (852, 8),
+        ];
+        for &(cc, len) in lens_to_check {
+            let groups = group_sizes(cc, len).unwrap();
+            assert_eq!(groups.iter().sum::<usize>(), len, "cc {cc} len {len}");
+        }
+    }
+
+    #[test]
+    fn unlisted_country_has_no_grouping() {
+        assert_eq!(group_sizes(44, 10), None);
     }
 }
