@@ -5,7 +5,9 @@
 //! split off with the real ITU-T E.164 prefix table (see
 //! `country_codes`) and then only an overall length check, since
 //! validating the national number itself would require each country's
-//! own numbering plan.
+//! own numbering plan. A trailing extension (`x1234`, `ext. 1234`,
+//! `extension 1234`) is split off before any of that and carried
+//! alongside the parsed number rather than being folded into it.
 
 use crate::country_codes;
 use std::fmt;
@@ -14,6 +16,7 @@ use std::fmt;
 pub struct PhoneNumber {
     pub country_code: u16,
     pub national_number: String,
+    pub extension: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,10 +46,13 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Parse a single phone number out of `raw`, which may still carry the
-/// punctuation a human would type: spaces, dashes, dots, parens.
+/// punctuation a human would type: spaces, dashes, dots, parens, and a
+/// trailing extension.
 pub fn parse(raw: &str) -> Result<PhoneNumber, ParseError> {
-    let has_plus = raw.trim_start().starts_with('+');
-    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
+    let (main, extension) = split_extension(raw);
+
+    let has_plus = main.trim_start().starts_with('+');
+    let digits: String = main.chars().filter(|c| c.is_ascii_digit()).collect();
 
     if digits.is_empty() {
         return Err(ParseError::NoDigits);
@@ -55,18 +61,59 @@ pub fn parse(raw: &str) -> Result<PhoneNumber, ParseError> {
         return Err(ParseError::TooLong);
     }
 
-    if has_plus {
-        return parse_e164(&digits);
+    let mut number = if has_plus {
+        parse_e164(&digits)?
+    } else {
+        // No leading '+': assume NANP, since that's the only plan we
+        // validate in full right now.
+        match digits.len() {
+            10 => parse_nanp(&digits, 1)?,
+            11 if digits.starts_with('1') => parse_nanp(&digits[1..], 1)?,
+            n if n < 8 => return Err(ParseError::TooShort),
+            _ => parse_e164(&digits)?,
+        }
+    };
+    number.extension = extension;
+    Ok(number)
+}
+
+/// Split a trailing extension off of `raw`. Recognizes `x1234`,
+/// `ext 1234`, `ext. 1234`, and `extension 1234` (case-insensitively),
+/// anchored to the end of the string so a marker doesn't need a digit
+/// immediately after it just to get skipped as a false positive.
+/// Returns the text to parse as the main number, plus the extension
+/// digits if a marker was actually found.
+fn split_extension(raw: &str) -> (&str, Option<String>) {
+    let lower = raw.to_ascii_lowercase();
+    const MARKERS: [&str; 3] = ["extension", "ext", "x"];
+
+    for marker in MARKERS {
+        let mut search_start = 0;
+        while let Some(rel_pos) = lower[search_start..].find(marker) {
+            let pos = search_start + rel_pos;
+
+            // Require the marker not be part of a longer word (e.g. the
+            // "x" in "Box", or the "ext" in "Text") by checking that
+            // whatever precedes it, if anything, isn't a letter.
+            let before_ok = raw[..pos]
+                .chars()
+                .next_back()
+                .map(|c| !c.is_ascii_alphabetic())
+                .unwrap_or(true);
+
+            let after = raw[pos + marker.len()..].trim_start_matches('.').trim_start();
+            let ext_digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let trailing = &after[ext_digits.len()..];
+
+            if before_ok && !ext_digits.is_empty() && trailing.trim().is_empty() {
+                return (&raw[..pos], Some(ext_digits));
+            }
+
+            search_start = pos + marker.len();
+        }
     }
 
-    // No leading '+': assume NANP, since that's the only plan we
-    // validate in full right now.
-    match digits.len() {
-        10 => parse_nanp(&digits, 1),
-        11 if digits.starts_with('1') => parse_nanp(&digits[1..], 1),
-        n if n < 8 => Err(ParseError::TooShort),
-        _ => parse_e164(&digits),
-    }
+    (raw, None)
 }
 
 fn parse_e164(digits: &str) -> Result<PhoneNumber, ParseError> {
@@ -80,6 +127,7 @@ fn parse_e164(digits: &str) -> Result<PhoneNumber, ParseError> {
         Some((cc, national)) => Ok(PhoneNumber {
             country_code: cc,
             national_number: national.to_string(),
+            extension: None,
         }),
         None => Err(ParseError::UnknownCountryCode),
     }
@@ -99,6 +147,7 @@ fn parse_nanp(national: &str, country_code: u16) -> Result<PhoneNumber, ParseErr
     Ok(PhoneNumber {
         country_code,
         national_number: national.to_string(),
+        extension: None,
     })
 }
 
@@ -119,7 +168,7 @@ impl fmt::Display for PhoneNumber {
                 n[7] as char,
                 n[8] as char,
                 n[9] as char,
-            )
+            )?;
         } else if let Some(groups) =
             country_codes::group_sizes(self.country_code, self.national_number.len())
         {
@@ -133,10 +182,14 @@ impl fmt::Display for PhoneNumber {
                 f.write_str(head)?;
                 rest = tail;
             }
-            Ok(())
         } else {
-            write!(f, "+{} {}", self.country_code, self.national_number)
+            write!(f, "+{} {}", self.country_code, self.national_number)?;
         }
+
+        if let Some(ext) = &self.extension {
+            write!(f, " ext. {ext}")?;
+        }
+        Ok(())
     }
 }
 
@@ -228,5 +281,54 @@ mod tests {
         // generic "+cc national-number" form.
         let n = parse("+44 20 7946 0958").unwrap();
         assert_eq!(n.to_string(), "+44 2079460958");
+    }
+
+    #[test]
+    fn parses_x_style_extension() {
+        let n = parse("212-555-0143x1234").unwrap();
+        assert_eq!(n.national_number, "2125550143");
+        assert_eq!(n.extension, Some("1234".to_string()));
+        assert_eq!(n.to_string(), "+1 (212) 555-0143 ext. 1234");
+    }
+
+    #[test]
+    fn parses_x_style_extension_with_leading_space() {
+        let n = parse("212-555-0143 x1234").unwrap();
+        assert_eq!(n.extension, Some("1234".to_string()));
+        assert_eq!(n.national_number, "2125550143");
+    }
+
+    #[test]
+    fn parses_ext_dot_style_extension() {
+        let n = parse("212-555-0143 ext. 1234").unwrap();
+        assert_eq!(n.extension, Some("1234".to_string()));
+        assert_eq!(n.national_number, "2125550143");
+    }
+
+    #[test]
+    fn parses_ext_style_extension_without_dot() {
+        let n = parse("212-555-0143 ext 1234").unwrap();
+        assert_eq!(n.extension, Some("1234".to_string()));
+    }
+
+    #[test]
+    fn parses_extension_word_style_extension() {
+        let n = parse("212-555-0143 extension 1234").unwrap();
+        assert_eq!(n.extension, Some("1234".to_string()));
+    }
+
+    #[test]
+    fn extension_marker_inside_a_word_is_not_mistaken_for_one() {
+        // "Text" contains "ext", but it isn't a real extension marker
+        // since a letter comes right before it.
+        let n = parse("Text 2125550143").unwrap();
+        assert_eq!(n.extension, None);
+        assert_eq!(n.national_number, "2125550143");
+    }
+
+    #[test]
+    fn number_without_extension_has_none() {
+        let n = parse("2125550143").unwrap();
+        assert_eq!(n.extension, None);
     }
 }

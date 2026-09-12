@@ -32,7 +32,14 @@ let number = parse("(212) 555-0143").unwrap();
 assert_eq!(number.to_string(), "+1 (212) 555-0143");
 
 assert!(parse("(112) 555-0143").is_err()); // area code can't start with 1
+
+let with_ext = parse("212-555-0143 ext. 1234").unwrap();
+assert_eq!(with_ext.extension, Some("1234".to_string()));
+assert_eq!(with_ext.to_string(), "+1 (212) 555-0143 ext. 1234");
 ```
+
+Extensions are recognized as `x1234`, `ext 1234`, `ext. 1234`, or
+`extension 1234`, anchored to the end of the input.
 
 Scanning a stream for every candidate number in it:
 
@@ -78,6 +85,9 @@ and exits non-zero if any candidate failed to parse.
   the scanner looks for the longest leading segment that does, reports
   it, and keeps going with what's left — but a pathological run that
   happens to parse as one (very) long invalid number won't get split.
+- `parse` recognizes extensions, but the scanner doesn't yet: its
+  candidate runs stop at the first letter, so `x1234` / `ext. 1234`
+  after a scanned number is dropped rather than attached.
 
 ## License
 
