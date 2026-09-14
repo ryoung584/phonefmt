@@ -11,9 +11,114 @@ const BUF_SIZE: usize = 8 * 1024;
 
 /// Characters we consider part of a phone-number-looking run. Once a
 /// character outside this set (or the end of input) shows up, whatever
-/// has been accumulated so far is handed to the parser.
+/// has been accumulated so far is handed to the parser. Letters aren't
+/// in this set - a trailing extension marker is recognized separately
+/// by `ExtState` so ordinary prose doesn't get pulled into candidates.
 fn is_candidate_char(c: char) -> bool {
     c.is_ascii_digit() || matches!(c, '+' | '-' | '.' | '(' | ')' | ' ')
+}
+
+/// The longest extension marker `parser::split_extension` recognizes.
+/// "ext" is a prefix of it, so matching has to stay open past "ext"
+/// until either the word completes or the next character rules it out.
+const EXTENSION_MARKER: &str = "extension";
+
+/// Whether appending `c` to a marker attempt that has already matched
+/// `matched_len` characters of `EXTENSION_MARKER` would still keep it a
+/// valid (case-insensitive) prefix.
+fn extends_extension_marker(matched_len: usize, c: char) -> bool {
+    c.is_ascii_alphabetic()
+        && EXTENSION_MARKER
+            .as_bytes()
+            .get(matched_len)
+            .map_or(false, |&b| b == c.to_ascii_lowercase() as u8)
+}
+
+/// Tracks an in-progress attempt to recognize an extension marker
+/// (`x`, `ext`, `ext.`, `extension`) right after a number, so its
+/// digits can be folded into the same candidate instead of getting cut
+/// off by the first non-digit, non-punctuation character.
+enum ExtState {
+    /// Not currently looking at a possible marker.
+    Idle,
+    /// Letters seen so far are still a valid prefix of "extension" (and
+    /// not yet a complete marker on their own).
+    Matching(String),
+    /// A marker word has been confirmed; `raw` holds it plus whatever
+    /// optional dots/spaces and digits have followed, `digits` holds
+    /// just the digits. An extension is only real once `digits` is
+    /// non-empty.
+    AfterMarker { raw: String, digits: String },
+}
+
+/// Decide whether `c`, arriving right after an accumulated candidate,
+/// could be the start of an extension marker.
+fn try_start_marker(c: char) -> Option<ExtState> {
+    if c.eq_ignore_ascii_case(&'x') {
+        Some(ExtState::AfterMarker { raw: c.to_string(), digits: String::new() })
+    } else if extends_extension_marker(0, c) {
+        Some(ExtState::Matching(c.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Feed one character through the candidate/extension state machine.
+/// May recurse once or twice to re-evaluate the same character after a
+/// state transition (e.g. once a marker attempt is abandoned, `c` still
+/// needs to be handled as ordinary input).
+fn handle_char<F: FnMut(&str, Result<PhoneNumber, ParseError>)>(
+    c: char,
+    candidate: &mut String,
+    ext: &mut ExtState,
+    on_match: &mut F,
+) {
+    match ext {
+        ExtState::Idle => {
+            if is_candidate_char(c) {
+                candidate.push(c);
+            } else if !candidate.is_empty() {
+                match try_start_marker(c) {
+                    Some(state) => *ext = state,
+                    None => flush(candidate, on_match),
+                }
+            }
+        }
+        ExtState::Matching(raw) => {
+            if extends_extension_marker(raw.len(), c) {
+                raw.push(c);
+                if raw.eq_ignore_ascii_case(EXTENSION_MARKER) {
+                    let raw = std::mem::take(raw);
+                    *ext = ExtState::AfterMarker { raw, digits: String::new() };
+                }
+            } else if raw.eq_ignore_ascii_case("ext") {
+                let raw = std::mem::take(raw);
+                *ext = ExtState::AfterMarker { raw, digits: String::new() };
+                handle_char(c, candidate, ext, on_match);
+            } else {
+                *ext = ExtState::Idle;
+                flush(candidate, on_match);
+                handle_char(c, candidate, ext, on_match);
+            }
+        }
+        ExtState::AfterMarker { raw, digits } => {
+            if c.is_ascii_digit() {
+                raw.push(c);
+                digits.push(c);
+            } else if digits.is_empty() && (c == '.' || c == ' ') {
+                raw.push(c);
+            } else if !digits.is_empty() {
+                let raw = std::mem::take(raw);
+                candidate.push_str(&raw);
+                *ext = ExtState::Idle;
+                handle_char(c, candidate, ext, on_match);
+            } else {
+                *ext = ExtState::Idle;
+                flush(candidate, on_match);
+                handle_char(c, candidate, ext, on_match);
+            }
+        }
+    }
 }
 
 /// Scan `reader` for phone-number candidates and invoke `on_match` for
@@ -25,6 +130,7 @@ pub fn scan<R: Read, F: FnMut(&str, Result<PhoneNumber, ParseError>)>(
 ) -> io::Result<()> {
     let mut buf = [0u8; BUF_SIZE];
     let mut candidate = String::new();
+    let mut ext = ExtState::Idle;
     // Bytes at the end of a chunk that didn't form a complete UTF-8
     // character, carried over so we don't lose or mangle them.
     let mut leftover: Vec<u8> = Vec::new();
@@ -49,11 +155,17 @@ pub fn scan<R: Read, F: FnMut(&str, Result<PhoneNumber, ParseError>)>(
         };
 
         for c in text.chars() {
-            if is_candidate_char(c) {
-                candidate.push(c);
-            } else if !candidate.is_empty() {
-                flush(&mut candidate, &mut on_match);
-            }
+            handle_char(c, &mut candidate, &mut ext, &mut on_match);
+        }
+    }
+
+    // A marker that got all the way to collecting digits (but hasn't
+    // hit a terminating character yet, since input just ran out) is a
+    // real extension; fold it in before the final flush. Anything less
+    // complete than that gets dropped, same as mid-stream abandonment.
+    if let ExtState::AfterMarker { raw, digits } = &ext {
+        if !digits.is_empty() {
+            candidate.push_str(raw);
         }
     }
 
@@ -202,6 +314,90 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "+44 20 7946 0958");
         assert!(found[0].1.is_ok());
+    }
+
+    #[test]
+    fn captures_x_style_extension() {
+        let input = "call 212-555-0143x1234 now";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "212-555-0143x1234");
+        let number = found[0].1.as_ref().unwrap();
+        assert_eq!(number.extension, Some("1234".to_string()));
+    }
+
+    #[test]
+    fn captures_ext_dot_style_extension_with_space_before_it() {
+        let input = "front desk 212-555-0143 ext. 1234 during business hours";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "212-555-0143 ext. 1234");
+        let number = found[0].1.as_ref().unwrap();
+        assert_eq!(number.extension, Some("1234".to_string()));
+    }
+
+    #[test]
+    fn captures_extension_word_style_extension() {
+        let input = "212-555-0143 extension 1234";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "212-555-0143 extension 1234");
+        let number = found[0].1.as_ref().unwrap();
+        assert_eq!(number.extension, Some("1234".to_string()));
+    }
+
+    #[test]
+    fn extension_survives_across_read_buffer_boundary() {
+        struct OneByteAtATime<'a>(&'a [u8]);
+        impl<'a> Read for OneByteAtATime<'a> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.0[0];
+                self.0 = &self.0[1..];
+                Ok(1)
+            }
+        }
+
+        let input = b"212-555-0143 ext 1234";
+        let mut found = Vec::new();
+        scan(OneByteAtATime(input), |raw, result| {
+            found.push((raw.to_string(), result))
+        })
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "212-555-0143 ext 1234");
+        let number = found[0].1.as_ref().unwrap();
+        assert_eq!(number.extension, Some("1234".to_string()));
+    }
+
+    #[test]
+    fn word_starting_like_a_marker_does_not_swallow_a_second_number() {
+        // "extra" starts the same way "extension" does; the marker
+        // attempt should get abandoned rather than eating the first
+        // number or the one that follows it.
+        let input = "212-555-0143 extra 800-555-0199";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        let raws: Vec<&str> = found.iter().map(|(raw, _)| raw.as_str()).collect();
+        assert_eq!(raws, vec!["212-555-0143", "800-555-0199"]);
+        assert!(found.iter().all(|(_, result)| result.is_ok()));
+    }
+
+    #[test]
+    fn extension_on_first_number_does_not_block_split_from_second() {
+        let input = "212-555-0143 x1234 800-555-0199";
+        let mut found = Vec::new();
+        scan(input.as_bytes(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].0, "212-555-0143 x1234");
+        assert_eq!(found[0].1.as_ref().unwrap().extension, Some("1234".to_string()));
+        assert_eq!(found[1].0, "800-555-0199");
+        assert!(found[1].1.is_ok());
     }
 
     #[test]
