@@ -145,17 +145,45 @@ pub fn scan<R: Read, F: FnMut(&str, Result<PhoneNumber, ParseError>)>(
         chunk.append(&mut leftover);
         chunk.extend_from_slice(&buf[..n]);
 
-        let text = match std::str::from_utf8(&chunk) {
-            Ok(s) => s,
-            Err(e) => {
-                let valid_up_to = e.valid_up_to();
-                leftover.extend_from_slice(&chunk[valid_up_to..]);
-                std::str::from_utf8(&chunk[..valid_up_to]).expect("checked above")
-            }
-        };
+        // A chunk can contain more than one bad spot, and a bad byte
+        // partway through must not poison everything after it: only a
+        // sequence truncated by the true end of the chunk (error_len ==
+        // None) is worth holding onto, since more bytes next read might
+        // complete it. A sequence that's simply malformed (error_len ==
+        // Some) will never become valid no matter what arrives later,
+        // so it's skipped and decoding resumes right after it - keeping
+        // `leftover` bounded instead of letting one bad byte turn every
+        // later read into another zero-progress pass over the same
+        // ever-growing buffer.
+        let mut start = 0;
+        loop {
+            match std::str::from_utf8(&chunk[start..]) {
+                Ok(s) => {
+                    for c in s.chars() {
+                        handle_char(c, &mut candidate, &mut ext, &mut on_match);
+                    }
+                    break;
+                }
+                Err(e) => {
+                    let valid_up_to = e.valid_up_to();
+                    let text = std::str::from_utf8(&chunk[start..start + valid_up_to])
+                        .expect("checked above");
+                    for c in text.chars() {
+                        handle_char(c, &mut candidate, &mut ext, &mut on_match);
+                    }
 
-        for c in text.chars() {
-            handle_char(c, &mut candidate, &mut ext, &mut on_match);
+                    match e.error_len() {
+                        Some(bad_len) => {
+                            handle_char('\u{FFFD}', &mut candidate, &mut ext, &mut on_match);
+                            start += valid_up_to + bad_len;
+                        }
+                        None => {
+                            leftover.extend_from_slice(&chunk[start + valid_up_to..]);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -410,5 +438,54 @@ mod tests {
         assert!(found[0].1.is_ok());
         assert_eq!(found[1].0, "000-000-0000");
         assert!(found[1].1.is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_byte_does_not_swallow_the_rest_of_the_stream() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"212-555-0143 ");
+        input.push(0xFF); // never valid UTF-8, on its own or continued
+        input.extend_from_slice(b" 800-555-0199");
+
+        let mut found = Vec::new();
+        scan(input.as_slice(), |raw, result| found.push((raw.to_string(), result))).unwrap();
+
+        let raws: Vec<&str> = found.iter().map(|(raw, _)| raw.as_str()).collect();
+        assert_eq!(raws, vec!["212-555-0143", "800-555-0199"]);
+        assert!(found.iter().all(|(_, result)| result.is_ok()));
+    }
+
+    #[test]
+    fn invalid_utf8_byte_split_across_many_small_reads_does_not_swallow_the_rest() {
+        // With one byte per read, every read after the bad byte used to
+        // rebuild `chunk` starting with that same bad byte, so
+        // `valid_up_to()` came back 0 forever and the rest of the input
+        // just piled up in `leftover` and was thrown away at EOF.
+        struct OneByteAtATime<'a>(&'a [u8]);
+        impl<'a> Read for OneByteAtATime<'a> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.0[0];
+                self.0 = &self.0[1..];
+                Ok(1)
+            }
+        }
+
+        let mut input = Vec::new();
+        input.extend_from_slice(b"212-555-0143 ");
+        input.push(0xFF);
+        input.extend_from_slice(b" 800-555-0199");
+
+        let mut found = Vec::new();
+        scan(OneByteAtATime(&input), |raw, result| {
+            found.push((raw.to_string(), result))
+        })
+        .unwrap();
+
+        let raws: Vec<&str> = found.iter().map(|(raw, _)| raw.as_str()).collect();
+        assert_eq!(raws, vec!["212-555-0143", "800-555-0199"]);
+        assert!(found.iter().all(|(_, result)| result.is_ok()));
     }
 }
